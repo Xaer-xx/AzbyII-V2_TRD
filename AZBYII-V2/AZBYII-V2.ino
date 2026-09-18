@@ -90,7 +90,7 @@ static const uint8_t SensorPins[SensorCount] = {
 int   baseSpeed = 150;       // PWM na rovine
 int   minSpeed  = 95;        // PWM v najostrejsej korekcii
 float kp        = 3.0f;      // PWM na mm chyby
-float kd        = 20.0f;     // PWM na mm zmeny chyby (za jeden tik)
+float kd        = 100.0f;    // PWM na (mm/ms) zmeny chyby
 float posLpf    = 0.50f;     // vyhladenie polohy   (1 = ziadne)
 float dLpf      = 0.35f;     // vyhladenie derivacie
 float slowStart = 10.0f;     // od tejto chyby zacni spomalovat
@@ -98,16 +98,23 @@ float slowFull  = 40.0f;     // pri tejto chybe uz ides minSpeed
 float corrMax   = 200.0f;    // strop korekcie
 
 // --------------------------------------------------- LADENIE - RACE MODE
-// Na plny plyn treba ostrejsiu a menej filtrovanu reakciu, inak robot
-// hranu preleti. Spomalovanie zacina skor, aby stihol oblúk R125.
+// Zadanie: "nemusi ist presne po ciare, nech je najrychlejsi". Presnost je
+// teda obetovana zamerne:
+//  - spomalovat zacina az od 14 mm chyby (predtym 6) - do tej doby drzi
+//    plnych 255, aj ked sa hrana hupe po bare. Pruh je siroky 300 mm,
+//    takze huhanie o +-15 mm nicomu nevadi.
+//  - posLpf 0.80 = takmer nefiltrovana poloha. Filter znizuje sum, ale
+//    pridava oneskorenie, a pri plnej rychlosti je oneskorenie horsie.
+//  - minSpeed 165 = ani v najostrejsej korekcii nespadne pod tuto hranicu.
+//    TOTO je prvy parameter, ktory znizuj, ak robot vylietava z oblúka.
 #define RACE_BASE      255
-#define RACE_MIN       130
-#define RACE_KP        3.4f
-#define RACE_KD        26.0f
-#define RACE_POS_LPF   0.65f
-#define RACE_D_LPF     0.45f
-#define RACE_SLOW_FROM 6.0f
-#define RACE_SLOW_FULL 32.0f
+#define RACE_MIN       165
+#define RACE_KP        3.8f
+#define RACE_KD        150.0f
+#define RACE_POS_LPF   0.80f
+#define RACE_D_LPF     0.50f
+#define RACE_SLOW_FROM 14.0f
+#define RACE_SLOW_FULL 45.0f
 #define RACE_CORR_MAX  255.0f
 
 // Ked hrana zmizne, dosadi sa "virtualna chyba" s tymto znamienkom a
@@ -123,7 +130,10 @@ float corrMax   = 200.0f;    // strop korekcie
 #define SIDE_MIN_DIFF 1500   // rozdiel tmy L/R polovice pre urcenie strany
 #define EDGE_MIN      0.8f   // treba aspon tolko ciernej AJ bielej
 
-#define CONTROL_US    5000   // 200 Hz regulacia
+// 400 Hz. Skrateny timeout senzora po kalibracii to utiahne. Ked by nahodou
+// citanie predsa len pretiahlo tik, nic sa nedeje - derivacia sa pocita z
+// realneho dt, takze ladenie sa tym neposunie.
+#define CONTROL_US    2500
 
 #define CAL_STEPS 180        // kalibracny sweep
 #define CAL_FLIP  18
@@ -152,7 +162,8 @@ float  posFilt   = 0.0f;
 float  lastError = 0.0f;
 float  dFilt     = 0.0f;
 bool   acquired  = false;    // uz sme niekedy videli hranu?
-unsigned long lostSince = 0;
+unsigned long lostSince  = 0;
+unsigned long lastCtrlUs = 0;   // cas posledneho tiku, pre derivaciu
 
 struct Edge {
   bool  valid;
@@ -257,6 +268,15 @@ int speedFor(float absErr) {
 }
 
 void controlStep() {
+  // Skutocny cas medzi tikmi. Derivacia sa pocita na milisekundu, nie na
+  // tik, takze kd nezavisi od frekvencie slucky ani od toho, ci citanie
+  // senzora obcas pretiahne svoj tik.
+  unsigned long nowUs = micros();
+  float dtMs = (lastCtrlUs == 0) ? (CONTROL_US / 1000.0f)
+                                 : (nowUs - lastCtrlUs) / 1000.0f;
+  lastCtrlUs = nowUs;
+  dtMs = constrain(dtMs, 0.5f, 20.0f);
+
   Edge e = readEdge();
   bool  lost = !e.valid;
   float error;
@@ -292,7 +312,7 @@ void controlStep() {
   if (lost) {
     dFilt = 0.0f;
   } else {
-    float dErr = error - lastError;
+    float dErr = (error - lastError) / dtMs;      // mm za milisekundu
     dFilt += (dErr - dFilt) * dLpf;
   }
 
@@ -328,14 +348,26 @@ bool kalibracia() {
   zastav();
   digitalWrite(LED_BUILTIN, LOW);
 
-  // Bez seriaku je toto jediny sposob, ako sa dozvies o zlej kalibracii.
-  uint16_t worst = 65535;
+  uint16_t worst = 65535, darkest = 0;
   for (uint8_t i = 0; i < SensorCount; i++) {
     uint16_t mn = qtr.calibrationOn.minimum[i];
     uint16_t mx = qtr.calibrationOn.maximum[i];
     uint16_t sp = (mx > mn) ? (mx - mn) : 0;
-    if (sp < worst) worst = sp;
+    if (sp < worst)   worst   = sp;
+    if (mx > darkest) darkest = mx;
   }
+
+  // NAJVACSI ZDROJ RYCHLOSTI V CELOM KODE.
+  // QTR-RC meria cas vybitia kondenzatora. Default timeout 2500 us znamena,
+  // ze kazde citanie ciernej trva plnych 2.5 ms - to je cista latencia medzi
+  // tym, kde robot je, a tym, ako na to zareaguju motory. Teraz uz vieme z
+  // kalibracie, aka tmava je najtmavsia cierna, takze timeout stiahneme
+  // tesne nad nu. Kratsia latencia = vyssie gainy bez rozkmitania = vyssia
+  // rychlost. Tmavsi povrch nez pri kalibracii sa len oreze na 1000, cize
+  // sa tym nic nepokazi.
+  qtr.setTimeout(constrain((uint16_t)(darkest * 1.15f) + 60, 700, 2500));
+
+  // Bez seriaku je toto jediny sposob, ako sa dozvies o zlej kalibracii.
   if (worst < CAL_MIN_RANGE) blikni(6, 70);
   return true;
 }
@@ -450,6 +482,7 @@ void loop() {
       posFilt = lastError = dFilt = 0.0f;
       acquired    = false;
       lostSince   = 0;
+      lastCtrlUs  = 0;
       controlTick = false;
       stav = ST_RUN;
       break;
